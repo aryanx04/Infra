@@ -6,9 +6,9 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'devsecret';
-const REFERRAL_BONUS = 10; // per successful signup credited to referrer
+const REFERRAL_BONUS = 10;
 
 // ---------- Simple JSON data store ----------
 const dbDir = path.join(__dirname, 'db');
@@ -35,13 +35,8 @@ function readJSON(file) {
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf-8');
 }
-
 function uid(prefix = '') {
-  return (
-    prefix +
-    Math.random().toString(36).slice(2, 8) +
-    Math.random().toString(36).slice(2, 8)
-  );
+  return prefix + Math.random().toString(36).slice(2, 8) + Math.random().toString(36).slice(2, 8);
 }
 
 // ---------- Middleware ----------
@@ -50,6 +45,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ---------- Auth Middleware ----------
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -69,7 +65,6 @@ function getHost(req) {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${proto}://${host}`;
 }
-
 function publicUser(u) {
   return {
     id: u.id,
@@ -83,17 +78,15 @@ function publicUser(u) {
   };
 }
 
-// ---------- Auth ----------
+// ---------- Routes ----------
+
+// Register
 app.post('/api/register', async (req, res) => {
   const { phone, password, name, ref } = req.body;
-  if (!phone || !password || !name) {
-    return res.status(400).json({ error: 'phone, password, name required' });
-  }
+  if (!phone || !password || !name) return res.status(400).json({ error: 'Missing fields' });
 
   const users = readJSON(files.users);
-  if (users.find(u => u.phone === phone)) {
-    return res.status(409).json({ error: 'Phone already registered' });
-  }
+  if (users.find(u => u.phone === phone)) return res.status(409).json({ error: 'Phone already registered' });
 
   const passwordHash = await bcrypt.hash(password, 8);
   const referralCode = (name.split(' ')[0] || 'user').toLowerCase().slice(0, 4) + Math.random().toString(36).slice(2, 6);
@@ -111,20 +104,18 @@ app.post('/api/register', async (req, res) => {
   users.push(user);
   writeJSON(files.users, users);
 
-  // credit referrer if valid
+  // Credit referrer
   if (ref) {
-    const refUsers = readJSON(files.users);
-    const referrer = refUsers.find(u => u.referralCode === ref);
+    const referrer = users.find(u => u.referralCode === ref);
     if (referrer && referrer.id !== user.id) {
-      referrer.referralsCount = (referrer.referralsCount || 0) + 1;
-      referrer.earnings = (referrer.earnings || 0) + REFERRAL_BONUS;
-      writeJSON(files.users, refUsers);
+      referrer.referralsCount += 1;
+      referrer.earnings += REFERRAL_BONUS;
+      writeJSON(files.users, users);
 
       const referrals = readJSON(files.referrals);
       referrals.push({
         id: uid('r_'),
         referrerId: referrer.id,
-        referrerCode: referrer.referralCode,
         newUserId: user.id,
         amount: REFERRAL_BONUS,
         createdAt: new Date().toISOString()
@@ -147,14 +138,15 @@ app.post('/api/register', async (req, res) => {
   res.json({ token, user: publicUser(user) });
 });
 
+// Login
 app.post('/api/login', async (req, res) => {
   const { phone, password } = req.body;
-  if (!phone || !password) {
-    return res.status(400).json({ error: 'phone and password required' });
-  }
+  if (!phone || !password) return res.status(400).json({ error: 'Missing credentials' });
+
   const users = readJSON(files.users);
   const user = users.find(u => u.phone === phone);
   if (!user) return res.status(404).json({ error: 'User not found' });
+
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -162,6 +154,7 @@ app.post('/api/login', async (req, res) => {
   res.json({ token, user: publicUser(user) });
 });
 
+// Me
 app.get('/api/me', auth, (req, res) => {
   const users = readJSON(files.users);
   const me = users.find(u => u.id === req.user.id);
@@ -172,47 +165,39 @@ app.get('/api/me', auth, (req, res) => {
   res.json({
     user: publicUser(me),
     wallet: {
-      balance: me.earnings || 0,
+      balance: me.earnings,
       transactions
     },
     withdraws
   });
 });
 
-// ---------- Referral ----------
+// Referral link
 app.get('/api/referral/link', auth, (req, res) => {
   const users = readJSON(files.users);
   const me = users.find(u => u.id === req.user.id);
   if (!me) return res.status(404).json({ error: 'User not found' });
+
   const base = getHost(req);
   const link = `${base}/r/${me.referralCode}`;
   res.json({ link });
 });
 
-// Landing route: redirect to app with ?ref=code
+// Referral redirect
 app.get('/r/:code', (req, res) => {
   const code = req.params.code;
-  const target = `/index.html#register?ref=${encodeURIComponent(code)}`;
-  res.redirect(target);
+  res.redirect(`/index.html#register?ref=${encodeURIComponent(code)}`);
 });
 
-// ---------- Leaderboard ----------
+// Leaderboard
 app.get('/api/leaderboard', (req, res) => {
   const users = readJSON(files.users);
-  const topByEarnings = [...users]
-    .sort((a, b) => (b.earnings || 0) - (a.earnings || 0))
-    .slice(0, 20)
-    .map(u => ({ name: u.name, earnings: u.earnings || 0, referrals: u.referralsCount || 0 }));
-
-  const topByReferrals = [...users]
-    .sort((a, b) => (b.referralsCount || 0) - (a.referralsCount || 0))
-    .slice(0, 20)
-    .map(u => ({ name: u.name, referrals: u.referralsCount || 0, earnings: u.earnings || 0 }));
-
+  const topByEarnings = [...users].sort((a, b) => b.earnings - a.earnings).slice(0, 20);
+  const topByReferrals = [...users].sort((a, b) => b.referralsCount - a.referralsCount).slice(0, 20);
   res.json({ topByEarnings, topByReferrals });
 });
 
-// ---------- Wallet / Withdraw ----------
+// Withdraw
 app.post('/api/withdraw', auth, (req, res) => {
   const { amount, method, details } = req.body;
   const amt = Number(amount);
@@ -221,16 +206,13 @@ app.post('/api/withdraw', auth, (req, res) => {
   const users = readJSON(files.users);
   const me = users.find(u => u.id === req.user.id);
   if (!me) return res.status(404).json({ error: 'User not found' });
+  if (me.earnings < amt) return res.status(400).json({ error: 'Insufficient balance' });
 
-  if ((me.earnings || 0) < amt) {
-    return res.status(400).json({ error: 'Insufficient balance' });
-  }
-
-  me.earnings = (me.earnings || 0) - amt;
+  me.earnings -= amt;
   writeJSON(files.users, users);
 
   const withdraws = readJSON(files.withdraws);
-  const request = {
+  withdraws.push({
     id: uid('w_'),
     userId: me.id,
     amount: amt,
@@ -238,8 +220,7 @@ app.post('/api/withdraw', auth, (req, res) => {
     details: details || '',
     status: 'pending',
     createdAt: new Date().toISOString()
-  };
-  withdraws.push(request);
+  });
   writeJSON(files.withdraws, withdraws);
 
   const transactions = readJSON(files.transactions);
@@ -252,13 +233,8 @@ app.post('/api/withdraw', auth, (req, res) => {
   });
   writeJSON(files.transactions, transactions);
 
-  res.json({ ok: true, request });
+  res.json({ ok: true });
 });
 
-// ---------- Health ----------
-app.get('/api/health', (req, res) => res.json({ ok: true }));
-
-// ---------- Start ----------
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+// Health check
+app.get('/[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/germancifuentes/pruebagrupo21/tree/476355db03d412abd731eb710948d05732ccddf6/app.js?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "1")
